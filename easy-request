@@ -1,0 +1,224 @@
+import sys
+import json
+import requests
+import argparse
+from urllib.parse import urlparse
+def read_data_from_arg(data_arg):
+    if data_arg and data_arg.startswith('@'):
+        filepath = data_arg[1:]
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return f.read()
+        except Exception as e:
+            print(f"错误: 无法读取文件 {filepath} - {e}")
+            sys.exit(1)
+    return data_arg
+def send_request(url, data):
+    headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'easy-request/1.0'
+    }
+    return send_custom_request(url, 'POST', headers, data)
+def parse_headers(headers_arg):
+    if not headers_arg:
+        return {}
+    
+    # 尝试解析为JSON
+    try:
+        headers = json.loads(headers_arg)
+        if isinstance(headers, dict):
+            return headers
+    except json.JSONDecodeError:
+        pass
+    
+    headers = {}
+    try:
+        pairs = headers_arg.split(',')
+        for pair in pairs:
+            if ':' in pair:
+                key, value = pair.split(':', 1)
+                headers[key.strip()] = value.strip()
+    except:
+        pass
+    
+    return headers
+
+def send_custom_request(url, method, headers, data):
+    try:
+        parsed_url = urlparse(url)
+        if not parsed_url.scheme:
+            suggested_url = 'http://' + url
+            print(f"提示: URL缺少协议，已自动添加 http://")
+            url = suggested_url
+        
+        print(f"发送 {method} 请求到: {url}")
+        print(f"请求头: {headers}")
+        print(f"请求内容: {data[:200]}{'...' if len(data) > 200 else ''}")  # 预览
+        
+        # 设置默认User-Agent，如果用户没有提供
+        if 'User-Agent' not in headers:
+            headers['User-Agent'] = 'easy-request/1.0'
+        
+        # 根据方法发送请求
+        method = method.upper()
+        if method == 'GET':
+            response = requests.get(url, headers=headers, timeout=10)
+        elif method == 'POST':
+            # 尝试判断是否为JSON数据
+            try:
+                json_data = json.loads(data)
+                if 'Content-Type' not in headers:
+                    headers['Content-Type'] = 'application/json'
+                response = requests.post(url, headers=headers, json=json_data, timeout=10)
+            except json.JSONDecodeError:
+                if 'Content-Type' not in headers:
+                    headers['Content-Type'] = 'text/plain'
+                response = requests.post(url, headers=headers, data=data, timeout=10)
+        elif method == 'PUT':
+            try:
+                json_data = json.loads(data)
+                if 'Content-Type' not in headers:
+                    headers['Content-Type'] = 'application/json'
+                response = requests.put(url, headers=headers, json=json_data, timeout=10)
+            except json.JSONDecodeError:
+                if 'Content-Type' not in headers:
+                    headers['Content-Type'] = 'text/plain'
+                response = requests.put(url, headers=headers, data=data, timeout=10)
+        elif method == 'DELETE':
+            response = requests.delete(url, headers=headers, timeout=10)
+        elif method == 'PATCH':
+            try:
+                json_data = json.loads(data)
+                if 'Content-Type' not in headers:
+                    headers['Content-Type'] = 'application/json'
+                response = requests.patch(url, headers=headers, json=json_data, timeout=10)
+            except json.JSONDecodeError:
+                if 'Content-Type' not in headers:
+                    headers['Content-Type'] = 'text/plain'
+                response = requests.patch(url, headers=headers, data=data, timeout=10)
+        elif method == 'HEAD':
+            response = requests.head(url, headers=headers, timeout=10)
+        elif method == 'OPTIONS':
+            response = requests.options(url, headers=headers, timeout=10)
+        else:
+            print(f"错误: 不支持的请求类型 '{method}'")
+            print("支持的请求类型: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS")
+            return False
+        
+        print(f"\n响应状态码: {response.status_code}")
+        print(f"响应头:")
+        for key, value in response.headers.items():
+            print(f"  {key}: {value}")
+        print(f"\n响应内容:")
+        try:
+            json_response = response.json()
+            print(json.dumps(json_response, indent=2, ensure_ascii=False))
+        except:
+            print(response.text[:1000])
+        return True
+    except requests.exceptions.Timeout:
+        print("错误: 请求超时。")
+        return False
+    except requests.exceptions.ConnectionError:
+        print("错误: 连接失败。")
+        return False
+    except requests.exceptions.RequestException as e:
+        print(f"错误: 请求失败 - {e}")
+        return False
+    except Exception as e:
+        print(f"错误: 发生未知错误 - {e}")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='向指定URL发送HTTP请求（支持自定义请求类型、请求头和内容）',
+        add_help=False
+    )
+    parser.add_argument('url', nargs='?', help='目标URL（可省略协议，默认添加http://）')
+    parser.add_argument('method', nargs='?', help='请求类型（GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS）')
+    parser.add_argument('headers', nargs='?', help='请求头（JSON格式或键值对，如 "Content-Type: application/json"）')
+    parser.add_argument('data', nargs='?', help='请求内容。可使用 @文件名 从文件读取，或通过标准输入传递')
+    parser.add_argument('-h', '--help', action='store_true', help='显示帮助信息')
+    parser.add_argument('--legacy', action='store_true', help='使用旧版格式（仅URL和data）')
+    
+    args = parser.parse_args()
+
+    if args.help or len(sys.argv) == 1:
+        print("""
+easy-request - 自定义HTTP请求工具
+
+格式:
+  easy-request <URL*> <请求类型*> <请求头*> <请求内容*>（带*为必须）
+
+参数说明:
+  URL      目标地址（可省略协议，默认添加 http://）
+  请求类型  HTTP方法：GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS
+  请求头    自定义请求头，支持格式：
+            - JSON格式：'{"Content-Type":"application/json","Authorization":"Bearer token"}'
+            - 键值对：'Content-Type: application/json, User-Agent: test'
+  请求内容  要发送的数据。支持：
+            - 直接作为参数传递
+            - 以 @ 开头表示文件路径
+            - 省略时自动从标准输入读取（如果存在）
+
+示例:
+  1. 发送GET请求:
+     easy-request https://httpbin.org/get GET '{"Accept":"application/json"}' ''
+  
+  2. 发送POST请求（JSON数据）:
+     easy-request https://httpbin.org/post POST '{"Content-Type":"application/json"}' '{"name":"test"}'
+  
+  3. 发送PUT请求（从文件读取数据）:
+     easy-request https://httpbin.org/put PUT 'Content-Type: application/json' @data.json
+  
+  4. 发送DELETE请求:
+     easy-request https://httpbin.org/delete DELETE '{}' ''
+  
+  5. 使用旧版格式:
+     easy-request https://httpbin.org/post '{"name":"test"}' --legacy
+
+  6. 查看帮助:
+     easy-request -h
+        """)
+        return 0
+    if args.legacy:
+        if not args.url:
+            print("错误: 必须提供URL参数")
+            print("使用 'easy-request -h' 查看帮助")
+            return 1
+        
+        data = None
+        if args.method:  # 在旧版格式中，args.method实际上是data
+            data = read_data_from_arg(args.method)
+        elif not sys.stdin.isatty():
+            data = sys.stdin.read().strip()
+
+        if data is None:
+            print("错误: 必须提供请求内容（可通过参数、文件或标准输入提供）")
+            print("使用 'easy-request -h' 查看帮助")
+            return 1
+
+        success = send_request(args.url, data)
+        return 0 if success else 1
+    
+    # 新版格式：检查所有必需参数
+    if not args.url or not args.method or not args.headers:
+        print("错误: 需要4个必需参数：URL、请求类型、请求头、请求内容")
+        print("使用 'easy-request -h' 查看帮助")
+        return 1
+    headers = parse_headers(args.headers)
+    data = ''
+    if args.data:
+        data = read_data_from_arg(args.data)
+    elif not sys.stdin.isatty():
+        data = sys.stdin.read().strip()
+    valid_methods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']
+    if args.method.upper() not in valid_methods:
+        print(f"错误: 无效的请求类型 '{args.method}'")
+        print(f"支持的请求类型: {', '.join(valid_methods)}")
+        return 1
+    
+    success = send_custom_request(args.url, args.method, headers, data)
+    return 0 if success else 1
+if __name__ == "__main__":
+    sys.exit(main())
