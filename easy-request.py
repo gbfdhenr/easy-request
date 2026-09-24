@@ -68,7 +68,6 @@ def create_ssl_context(ca_file: str | None) -> ssl.SSLContext:
     """创建SSL上下文，支持自定义CA证书"""
     if ca_file:
         context = ssl.create_default_context(cafile=ca_file)
-        # 当指定CA时，强制验证证书
         context.verify_mode = ssl.CERT_REQUIRED
         context.check_hostname = True
     else:
@@ -80,60 +79,53 @@ def build_request(method: str, path: str, headers: dict[str, str], data: str) ->
     """构建HTTP请求字节流"""
     lines = [f"{method} {path} HTTP/1.1"]
 
-    # 添加Host头（必须）
     host_header = headers.get('Host') or headers.get('host')
     if not host_header:
-        # 如果没有Host头，我们需要从URL中获取，但这里已经分离了
-        pass  # Host将在send_request中添加
+        pass
 
-    # 如果有数据且没有Content-Length，自动添加
     if data and 'Content-Length' not in headers and 'content-length' not in headers:
         headers['Content-Length'] = str(len(data.encode('utf-8')))
 
     for key, value in headers.items():
         lines.append(f"{key}: {value}")
 
-    lines.append("")  # 第一个空行
-    lines.append("")  # 第二个空行，确保有 \r\n\r\n
+    lines.append("")
+    lines.append("")
     request = "\r\n".join(lines)
 
     if data:
-        request += data  # 不需要额外的 \r\n，因为 headers 结束已经有了 \r\n\r\n
+        request += data
 
     return request.encode('utf-8')
 
 
 def parse_response(response_bytes: bytes) -> Tuple[int, dict[str, str], str]:
     """解析HTTP响应，返回 (status_code, headers, body)"""
-    # 分离头和体
     header_end = response_bytes.find(b'\r\n\r\n')
     if header_end == -1:
-        # 尝试只找 \n\n
         header_end = response_bytes.find(b'\n\n')
         if header_end == -1:
             return 0, {}, response_bytes.decode('utf-8', errors='replace')
-    
+
     header_bytes = response_bytes[:header_end]
-    body_bytes = response_bytes[header_end + 4:]  # 跳过 \r\n\r\n
-    
-    # 解析状态行
+    body_bytes = response_bytes[header_end + 4:]
+
     header_lines = header_bytes.decode('utf-8', errors='replace').split('\r\n')
     if not header_lines:
         return 0, {}, body_bytes.decode('utf-8', errors='replace')
-    
+
     status_line = header_lines[0]
     try:
         status_code = int(status_line.split(' ')[1])
     except (IndexError, ValueError):
         status_code = 0
-    
-    # 解析响应头
+
     headers = {}
     for line in header_lines[1:]:
         if ':' in line:
             key, value = line.split(':', 1)
             headers[key.strip()] = value.strip()
-    
+
     body = body_bytes.decode('utf-8', errors='replace')
     return status_code, headers, body
 
@@ -141,8 +133,7 @@ def parse_response(response_bytes: bytes) -> Tuple[int, dict[str, str], str]:
 def recv_all(sock: socket.socket, timeout: float = DEFAULT_TIMEOUT) -> bytes:
     """接收完整的HTTP响应"""
     sock.settimeout(timeout)
-    
-    # 先读取头部
+
     header_chunks = []
     header_end = -1
     while header_end == -1:
@@ -154,20 +145,19 @@ def recv_all(sock: socket.socket, timeout: float = DEFAULT_TIMEOUT) -> bytes:
         header_end = combined.find(b'\r\n\r\n')
         if header_end == -1:
             header_end = combined.find(b'\n\n')
-    
+
     if header_end == -1:
         return b''.join(header_chunks)
-    
+
     header_bytes = b''.join(header_chunks)[:header_end + 4]
     body_start = header_end + 4
     remaining_body = b''.join(header_chunks)[body_start:]
-    
-    # 解析头部以获取 Content-Length 或 Transfer-Encoding
+
     header_text = header_bytes.decode('utf-8', errors='replace')
     content_length = None
     chunked = False
     connection_close = False
-    
+
     for line in header_text.split('\r\n'):
         line_lower = line.lower()
         if line_lower.startswith('content-length:'):
@@ -179,16 +169,13 @@ def recv_all(sock: socket.socket, timeout: float = DEFAULT_TIMEOUT) -> bytes:
             chunked = True
         elif line_lower.startswith('connection:') and 'close' in line_lower:
             connection_close = True
-    
+
     body_chunks = [remaining_body] if remaining_body else []
     total_body_len = len(remaining_body)
-    
+
     if chunked:
-        # 分块传输编码读取
         while True:
-            # 读取直到找到完整的块
             combined = b''.join(body_chunks)
-            # 简单的分块解析：每块以 \r\n 分隔，以 0 长度块结束
             while True:
                 chunk_end = combined.find(b'\r\n')
                 if chunk_end == -1:
@@ -198,37 +185,33 @@ def recv_all(sock: socket.socket, timeout: float = DEFAULT_TIMEOUT) -> bytes:
                     chunk_size = int(size_line.strip(), 16)
                 except ValueError:
                     chunk_size = 0
-                
+
                 if chunk_size == 0:
-                    # 最后一块，读取结束标记 \r\n
                     if len(combined) >= chunk_end + 4:
                         return header_bytes + combined[:chunk_end + 4]
                     break
-                
+
                 chunk_data_start = chunk_end + 2
                 chunk_data_end = chunk_data_start + chunk_size
-                if len(combined) >= chunk_data_end + 2:  # +2 for \r\n after chunk
+                if len(combined) >= chunk_data_end + 2:
                     combined = combined[chunk_data_end + 2:]
                     continue
                 break
-            
-            # 需要更多数据
+
             chunk = sock.recv(4096)
             if not chunk:
                 break
             body_chunks.append(chunk)
-    
+
     elif content_length is not None:
-        # 按 Content-Length 读取
         while total_body_len < content_length:
             chunk = sock.recv(4096)
             if not chunk:
                 break
             body_chunks.append(chunk)
             total_body_len += len(chunk)
-    
+
     else:
-        # 无 Content-Length，读取直到连接关闭
         if connection_close:
             while True:
                 chunk = sock.recv(4096)
@@ -236,7 +219,6 @@ def recv_all(sock: socket.socket, timeout: float = DEFAULT_TIMEOUT) -> bytes:
                     break
                 body_chunks.append(chunk)
         else:
-            # keep-alive 但无长度信息，尝试读取直到超时
             try:
                 while True:
                     chunk = sock.recv(4096)
@@ -245,7 +227,7 @@ def recv_all(sock: socket.socket, timeout: float = DEFAULT_TIMEOUT) -> bytes:
                     body_chunks.append(chunk)
             except socket.timeout:
                 pass
-    
+
     return header_bytes + b''.join(body_chunks)
 
 
@@ -258,22 +240,18 @@ def send_request(url: str, method: str, headers: dict[str, str], data: str, ca_f
         print(f"支持的请求类型: {', '.join(sorted(VALID_METHODS))}")
         return False
 
-    # 解析URL
     host, port, path, is_https = parse_url(url)
 
-    # 如果指定了 --ca，必须使用 HTTPS
     if ca_file and not is_https:
         print("错误: 使用 --ca 参数时，URL 必须使用 HTTPS 协议")
         return False
 
-    # 确保Host头存在
     if 'Host' not in headers and 'host' not in headers:
         headers['Host'] = host
 
     if 'User-Agent' not in headers:
         headers['User-Agent'] = 'easy-request/1.0'
 
-    # 默认使用 Connection: close 避免 keep-alive 导致的读取问题
     if 'Connection' not in headers and 'connection' not in headers:
         headers['Connection'] = 'close'
 
@@ -283,25 +261,20 @@ def send_request(url: str, method: str, headers: dict[str, str], data: str, ca_f
     print(f"请求内容: {preview}")
 
     try:
-        # 创建socket连接
         sock = socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT)
 
         if is_https:
             context = create_ssl_context(ca_file)
             sock = context.wrap_socket(sock, server_hostname=host)
-        
-        # 构建并发送请求
+
         request_bytes = build_request(method, path, headers, data)
         sock.sendall(request_bytes)
-        
-        # 接收响应
+
         response_bytes = recv_all(sock)
         sock.close()
-        
-        # 解析响应
+
         status_code, resp_headers, body = parse_response(response_bytes)
-        
-        # 打印响应
+
         print(f"\n响应状态码: {status_code}")
         print("响应头:")
         for key, value in resp_headers.items():
@@ -311,7 +284,7 @@ def send_request(url: str, method: str, headers: dict[str, str], data: str, ca_f
             print(json.dumps(json.loads(body), indent=2, ensure_ascii=False))
         except json.JSONDecodeError:
             print(body[:1000])
-        
+
         return True
 
     except socket.timeout:
