@@ -2,27 +2,18 @@
 """
 easy-request - 自定义HTTP请求工具 / Custom HTTP Request Tool
 
-支持HTTP/1.1，处理chunked编码、压缩、多值头、大小限制、二进制上传/下载、重定向等。
-Supports HTTP/1.1 with chunked encoding, compression, multi-value headers, size limits, binary upload/download, redirects.
+基于 httpx 库，支持 HTTP/1.1 和 HTTP/2，处理压缩、多值头、大小限制、二进制上传/下载、重定向等。
+Based on httpx library, supports HTTP/1.1 and HTTP/2, compression, multi-value headers, size limits, binary upload/download, redirects.
 """
 import sys
 import json
 import argparse
-import socket
-import ssl
-import gzip
-import zlib
-import bz2
-import lzma
 import os
+import ssl
+from typing import Tuple, Optional, Dict, List, Union, BinaryIO
 from urllib.parse import urlparse
-from typing import Tuple, Optional, Dict, List, Union
 
-try:
-    import brotli
-    HAS_BROTLI = True
-except ImportError:
-    HAS_BROTLI = False
+import httpx
 
 DEFAULT_TIMEOUT = 10.0
 MAX_RESPONSE_SIZE = 10 * 1024 * 1024
@@ -38,14 +29,13 @@ TEXT_MIME_PREFIXES = ('text/', 'application/json', 'application/xml', 'applicati
 
 Headers = Dict[str, str]
 MultiHeaders = Dict[str, List[str]]
-HeaderCaseMap = Dict[str, str]  # lower -> original
+HeaderCaseMap = Dict[str, str]
 
 # =============================================================================
 # 翻译字典 / Translation Dictionary
 # =============================================================================
 TRANSLATIONS = {
     'zh': {
-        # CLI 帮助 / CLI Help
         'app_name': 'easy-request - 自定义HTTP请求工具',
         'usage': '格式: easy-request <URL*> <请求类型*> [请求头] [请求内容] [选项]',
         'url_desc': '目标地址（可省略协议，默认添加 http://）',
@@ -84,7 +74,6 @@ TRANSLATIONS = {
         'ex_help': '  9. 查看帮助:',
         'ex_help_cmd': '     easy-request -h',
 
-        # 日志/错误 / Logs/Errors
         'url_scheme_hint': '提示: URL缺少协议，已自动添加 http://',
         'sending_request': '发送 {method} 请求到: {url}',
         'request_headers': '请求头:',
@@ -106,7 +95,6 @@ TRANSLATIONS = {
         'err_max_redirects': '--max-redirects 必须为非负整数',
         'err_redirect_limit': '重定向次数超过限制 ({max_redirects})',
         'err_response_too_large': '响应过大，超过 {max_size} 字节限制',
-        'err_brotli_missing': '需要brotli库支持br解压: pip install brotli',
         'err_prefix': '错误: ',
         'redirect_msg': '重定向 ({status_code}) -> {location}',
         'response_status': '响应状态码: {status_code}',
@@ -172,7 +160,6 @@ TRANSLATIONS = {
         'err_max_redirects': '--max-redirects must be a non-negative integer',
         'err_redirect_limit': 'Redirect limit exceeded ({max_redirects})',
         'err_response_too_large': 'Response too large, exceeds {max_size} bytes limit',
-        'err_brotli_missing': 'brotli library required for br decompression: pip install brotli',
         'err_prefix': 'Error: ',
         'redirect_msg': 'Redirect ({status_code}) -> {location}',
         'response_status': 'Response status: {status_code}',
@@ -182,7 +169,6 @@ TRANSLATIONS = {
 
 
 def detect_language(args_lang: Optional[str]) -> str:
-    """检测语言：--lang > 环境变量 > 默认中文"""
     if args_lang:
         lang = args_lang.lower()
         if lang in ('zh', 'cn', 'chinese'):
@@ -194,7 +180,7 @@ def detect_language(args_lang: Optional[str]) -> str:
         return 'zh'
     if env_lang in ('en', 'us', 'english'):
         return 'en'
-    return 'zh'  # 默认中文
+    return 'zh'
 
 
 class I18n:
@@ -212,7 +198,6 @@ class I18n:
             return template
 
 
-# 全局 i18n 实例，main() 中初始化
 _i18n: Optional[I18n] = None
 
 
@@ -303,40 +288,6 @@ def ensure_url_scheme(url: str) -> str:
     return url
 
 
-def parse_url(url: str) -> Tuple[str, int, str, bool]:
-    parsed = urlparse(url)
-    host = parsed.hostname or ''
-    is_https = parsed.scheme == 'https'
-
-    try:
-        port = parsed.port or (443 if is_https else 80)
-    except ValueError:
-        log_error(get_i18n().tr('err_invalid_port', port=parsed.port))
-        sys.exit(1)
-
-    path = sanitize_path(parsed.path or '/')
-    if parsed.query:
-        path += '?' + parsed.query
-    if parsed.fragment:
-        path += '#' + parsed.fragment
-    return host, port, path, is_https
-
-
-def create_ssl_context(ca_file: Optional[str]) -> ssl.SSLContext:
-    if ca_file:
-        context = ssl.create_default_context(cafile=ca_file)
-        context.verify_mode = ssl.CERT_REQUIRED
-        context.check_hostname = True
-    else:
-        context = ssl.create_default_context()
-    return context
-
-
-def has_header(headers: Headers, name: str) -> bool:
-    name_lower = name.lower()
-    return any(k.lower() == name_lower for k in headers)
-
-
 def build_host_header(host: str, port: int, is_https: bool) -> str:
     default_port = 443 if is_https else 80
     if port != default_port:
@@ -344,291 +295,13 @@ def build_host_header(host: str, port: int, is_https: bool) -> str:
     return host
 
 
-def build_request(method: str, path: str, headers: Headers, data: Union[str, bytes]) -> bytes:
-    lines = [f"{method} {sanitize_path(path)} HTTP/1.1"]
-
-    if data and not has_header(headers, 'Content-Length'):
-        data_len = len(data) if isinstance(data, bytes) else len(data.encode('utf-8'))
-        headers['Content-Length'] = str(data_len)
-
-    for key, value in headers.items():
-        lines.append(f"{key}: {value}")
-
-    lines.append("")
-    request = "\r\n".join(lines) + "\r\n"
-
-    if isinstance(data, bytes):
-        return request.encode('utf-8') + data
-    if data:
-        request += data
-    return request.encode('utf-8')
-
-
-def parse_response_headers(header_bytes: bytes) -> Tuple[int, MultiHeaders, HeaderCaseMap]:
-    header_text = header_bytes.decode('utf-8', errors='replace')
-    header_lines = header_text.split('\r\n')
-
-    if not header_lines:
-        return 0, {}, {}
-
-    status_line = header_lines[0]
-    status_code = 0
-    try:
-        parts = status_line.split(' ', 2)
-        if len(parts) >= 2:
-            status_code = int(parts[1])
-    except (IndexError, ValueError):
-        pass
-
-    multi_headers: MultiHeaders = {}
-    case_map: HeaderCaseMap = {}
-    for line in header_lines[1:]:
-        if ':' in line:
-            key, value = line.split(':', 1)
-            key = key.strip()
-            value = value.strip()
-            key_lower = key.lower()
-            if key_lower not in multi_headers:
-                multi_headers[key_lower] = []
-                case_map[key_lower] = key
-            multi_headers[key_lower].append(value)
-
-    return status_code, multi_headers, case_map
-
-
-def get_header_first(headers: MultiHeaders, name: str) -> str:
-    values = headers.get(name.lower(), [])
-    return values[0] if values else ''
-
-
-def get_content_encoding(headers: MultiHeaders) -> str:
-    return get_header_first(headers, 'content-encoding').lower()
-
-
-def get_transfer_encoding(headers: MultiHeaders) -> str:
-    return get_header_first(headers, 'transfer-encoding').lower()
-
-
-def get_content_length(headers: MultiHeaders) -> Optional[int]:
-    val = get_header_first(headers, 'content-length')
-    if val:
-        try:
-            return int(val)
-        except ValueError:
-            return None
-    return None
-
-
-def get_connection(headers: MultiHeaders) -> str:
-    return get_header_first(headers, 'connection').lower()
-
-
-def get_content_type(headers: MultiHeaders) -> str:
-    return get_header_first(headers, 'content-type').lower()
-
-
-def get_location(headers: MultiHeaders) -> str:
-    return get_header_first(headers, 'location')
-
-
-def get_charset(headers: MultiHeaders) -> str:
-    ct = get_content_type(headers)
-    for part in ct.split(';'):
-        part = part.strip()
-        if part.startswith('charset='):
-            return part[8:].strip(' "\'')
-    return 'utf-8'
-
-
-def is_text_response(headers: MultiHeaders) -> bool:
-    ct = get_content_type(headers)
+def is_text_response(headers: httpx.Headers) -> bool:
+    ct = headers.get('content-type', '').lower()
     return any(ct.startswith(p) for p in TEXT_MIME_PREFIXES)
 
 
 def is_redirect(status_code: int) -> bool:
     return status_code in REDIRECT_STATUS
-
-
-def decompress_body(body: bytes, encoding: str) -> bytes:
-    i18n = get_i18n()
-    if encoding == 'gzip':
-        return gzip.decompress(body)
-    elif encoding == 'deflate':
-        try:
-            return zlib.decompress(body)
-        except zlib.error:
-            return zlib.decompress(body, -zlib.MAX_WBITS)
-    elif encoding == 'br':
-        if HAS_BROTLI:
-            return brotli.decompress(body)
-        else:
-            log_error(i18n.tr('err_brotli_missing'))
-            return body
-    elif encoding == 'bzip2':
-        return bz2.decompress(body)
-    elif encoding == 'xz' or encoding == 'lzma':
-        return lzma.decompress(body)
-    return body
-
-
-def decode_body(body: bytes, charset: str) -> str:
-    try:
-        return body.decode(charset, errors='replace')
-    except LookupError:
-        return body.decode('utf-8', errors='replace')
-
-
-def parse_chunked_body(data: bytes) -> Tuple[bytes, bytes]:
-    result = bytearray()
-    pos = 0
-    length = len(data)
-
-    while pos < length:
-        chunk_start = pos
-        crlf_pos = data.find(b'\r\n', pos)
-        if crlf_pos == -1:
-            return bytes(result), data[chunk_start:]
-
-        size_line = data[pos:crlf_pos].strip()
-        pos = crlf_pos + 2
-
-        try:
-            chunk_size_str = size_line.split(b';')[0].strip()
-            chunk_size = int(chunk_size_str, 16)
-        except ValueError:
-            return bytes(result), data[chunk_start:]
-
-        if chunk_size == 0:
-            return bytes(result), data[pos:]
-
-        if pos + chunk_size + 2 > length:
-            return bytes(result), data[chunk_start:]
-
-        result.extend(data[pos:pos + chunk_size])
-        pos += chunk_size + 2
-
-    return bytes(result), b''
-
-
-def recv_all(sock: socket.socket, method: str, timeout: float = DEFAULT_TIMEOUT,
-             max_size: int = MAX_RESPONSE_SIZE) -> bytes:
-    i18n = get_i18n()
-    sock.settimeout(timeout)
-
-    header_chunks = []
-    header_end = -1
-    while header_end == -1:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        header_chunks.append(chunk)
-        combined = b''.join(header_chunks)
-        header_end = combined.find(b'\r\n\r\n')
-        if header_end == -1:
-            header_end = combined.find(b'\n\n')
-
-    if header_end == -1:
-        return b''.join(header_chunks)
-
-    combined_headers = b''.join(header_chunks)
-    header_end_marker_len = 4 if b'\r\n\r\n' in combined_headers[:header_end + 4] else 2
-    header_bytes = combined_headers[:header_end + header_end_marker_len]
-    body_start = header_end + header_end_marker_len
-    body_buffer = combined_headers[body_start:]
-
-    status_code, multi_headers, _ = parse_response_headers(header_bytes)
-    content_encoding = get_content_encoding(multi_headers)
-    transfer_encoding = get_transfer_encoding(multi_headers)
-    content_length = get_content_length(multi_headers)
-    connection_close = 'close' in get_connection(multi_headers)
-    chunked = 'chunked' in transfer_encoding
-
-    no_body = (method in NO_BODY_METHODS) or (status_code in NO_BODY_STATUS)
-    if no_body:
-        return header_bytes + body_buffer
-
-    body_chunks: List[bytes] = []
-    total_received = 0
-
-    try:
-        if chunked:
-            remaining = body_buffer
-            while True:
-                decoded, remaining = parse_chunked_body(remaining)
-                if decoded:
-                    body_chunks.append(decoded)
-                    total_received += len(decoded)
-                    if total_received > max_size:
-                        log_error(i18n.tr('err_response_too_large', max_size=max_size))
-                        break
-
-                if remaining.startswith(b'0\r\n\r\n'):
-                    remaining = remaining[5:]
-                    break
-                if remaining.startswith(b'0\r\n'):
-                    pass
-
-                if not remaining:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    remaining += chunk
-                    continue
-
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                remaining += chunk
-
-        elif content_length is not None:
-            while total_received < content_length:
-                chunk = sock.recv(min(4096, content_length - total_received))
-                if not chunk:
-                    break
-                body_chunks.append(chunk)
-                total_received += len(chunk)
-
-        else:
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                body_chunks.append(chunk)
-                total_received += len(chunk)
-                if total_received > max_size:
-                    log_error(i18n.tr('err_response_too_large', max_size=max_size))
-                    break
-
-    except socket.timeout:
-        pass
-
-    body = b''.join(body_chunks)
-
-    if content_encoding:
-        body = decompress_body(body, content_encoding)
-
-    return header_bytes + body
-
-
-def parse_response(response_bytes: bytes) -> Tuple[int, MultiHeaders, HeaderCaseMap, bytes]:
-    header_end = response_bytes.find(b'\r\n\r\n')
-    if header_end == -1:
-        header_end = response_bytes.find(b'\n\n')
-        if header_end == -1:
-            header_end_marker_len = 0
-            header_bytes = response_bytes
-            body_bytes = b''
-        else:
-            header_end_marker_len = 2
-            header_bytes = response_bytes[:header_end + header_end_marker_len]
-            body_bytes = response_bytes[header_end + header_end_marker_len:]
-    else:
-        header_end_marker_len = 4
-        header_bytes = response_bytes[:header_end + header_end_marker_len]
-        body_bytes = response_bytes[header_end + header_end_marker_len:]
-
-    status_code, multi_headers, case_map = parse_response_headers(header_bytes)
-    return status_code, multi_headers, case_map, body_bytes
 
 
 def resolve_redirect_url(base_url: str, location: str) -> str:
@@ -644,111 +317,145 @@ def resolve_redirect_url(base_url: str, location: str) -> str:
     return f"{scheme}://{netloc}{base_dir}{location}"
 
 
-def send_request(url: str, method: str, headers: Headers, data: Union[str, bytes],
-                 ca_file: Optional[str] = None, follow_redirects: bool = False,
-                 max_redirects: int = MAX_REDIRECTS) -> bool:
+def create_client(
+    ca_file: Optional[str],
+    follow_redirects: bool,
+    max_redirects: int,
+    timeout: float,
+) -> httpx.Client:
+    verify = True
+    if ca_file:
+        verify = ca_file
+
+    return httpx.Client(
+        follow_redirects=follow_redirects,
+        max_redirects=max_redirects,
+        timeout=httpx.Timeout(timeout, connect=timeout, read=timeout),
+        verify=verify,
+        http2=True,
+    )
+
+
+def send_request(
+    url: str,
+    method: str,
+    headers: Headers,
+    data: Union[str, bytes],
+    ca_file: Optional[str] = None,
+    follow_redirects: bool = False,
+    max_redirects: int = MAX_REDIRECTS,
+) -> bool:
     i18n = get_i18n()
-    redirect_count = 0
+    method = method.upper()
 
-    while True:
-        url = ensure_url_scheme(url)
-        method = method.upper()
-
-        if method not in VALID_METHODS:
-            log_error(i18n.tr('err_unsupported_method', method=method))
-            log_error(i18n.tr('err_valid_methods', methods=', '.join(sorted(VALID_METHODS))))
-            return False
-
-        host, port, path, is_https = parse_url(url)
-
-        if ca_file and not is_https:
-            log_error(i18n.tr('err_ca_requires_https'))
-            return False
-
-        headers_lower = {k.lower(): k for k in headers}
-        if 'host' not in headers_lower:
-            headers['Host'] = build_host_header(host, port, is_https)
-        if 'user-agent' not in headers_lower:
-            headers['User-Agent'] = 'easy-request/1.0'
-        if 'connection' not in headers_lower:
-            headers['Connection'] = 'close'
-
-        log_info(i18n.tr('sending_request', method=method, url=url))
-        log_info(i18n.tr('request_headers'))
-        for key, value in headers.items():
-            log_info(f"  {key}: {mask_sensitive_header(key, value)}")
-        if isinstance(data, bytes):
-            log_info(i18n.tr('request_body_binary', length=len(data)))
-        else:
-            preview = data[:200] + ('...' if len(data) > 200 else '')
-            log_info(i18n.tr('request_body_text', preview=preview))
-
-        sock = None
-        try:
-            sock = socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT)
-
-            if is_https:
-                context = create_ssl_context(ca_file)
-                sock = context.wrap_socket(sock, server_hostname=host)
-
-            request_bytes = build_request(method, path, headers, data)
-            sock.sendall(request_bytes)
-
-            response_bytes = recv_all(sock, method)
-
-            status_code, resp_headers, case_map, body_bytes = parse_response(response_bytes)
-
-            if follow_redirects and is_redirect(status_code) and redirect_count < max_redirects:
-                location = get_location(resp_headers)
-                if location:
-                    log_info(i18n.tr('redirect_msg', status_code=status_code, location=location))
-                    url = resolve_redirect_url(url, location)
-                    redirect_count += 1
-                    if status_code in {301, 302, 303}:
-                        method = 'GET'
-                        data = ''
-                    continue
-                elif redirect_count >= max_redirects:
-                    log_error(i18n.tr('err_redirect_limit', max_redirects=max_redirects))
-                    return False
-
-            is_text = is_text_response(resp_headers)
-            charset = get_charset(resp_headers) if is_text else 'utf-8'
-            body_text = decode_body(body_bytes, charset) if is_text else None
-
-            print(i18n.tr('response_status', status_code=status_code))
-            print(i18n.tr('response_headers'))
-            for key_lower, values in resp_headers.items():
-                orig_key = case_map.get(key_lower, key_lower)
-                for v in values:
-                    print(f"  {orig_key}: {v}")
-            print()
-
-            if is_text and body_text is not None:
-                print(body_text)
-            else:
-                sys.stdout.buffer.write(body_bytes)
-                sys.stdout.buffer.flush()
-
-            return True
-
-        except socket.timeout:
-            log_error(i18n.tr('err_timeout'))
-        except ConnectionRefusedError:
-            log_error(i18n.tr('err_connection_refused'))
-        except socket.gaierror:
-            log_error(i18n.tr('err_dns_failed'))
-        except ssl.SSLError as e:
-            log_error(i18n.tr('err_ssl', error=e))
-        except OSError as e:
-            log_error(i18n.tr('err_network', error=e))
-        finally:
-            if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+    if method not in VALID_METHODS:
+        log_error(i18n.tr('err_unsupported_method', method=method))
+        log_error(i18n.tr('err_valid_methods', methods=', '.join(sorted(VALID_METHODS))))
         return False
+
+    url = ensure_url_scheme(url)
+
+    # httpx 会自动处理 Host 头和重定向，不需要手动设置
+    # 但保留 User-Agent 和 Connection 用户可覆盖
+    headers_lower = {k.lower(): k for k in headers}
+    if 'user-agent' not in headers_lower:
+        headers['User-Agent'] = 'easy-request/1.0'
+
+    # 打印请求信息
+    log_info(i18n.tr('sending_request', method=method, url=url))
+    log_info(i18n.tr('request_headers'))
+    for key, value in headers.items():
+        log_info(f"  {key}: {mask_sensitive_header(key, value)}")
+    if isinstance(data, bytes):
+        log_info(i18n.tr('request_body_binary', length=len(data)))
+    else:
+        preview = data[:200] + ('...' if len(data) > 200 else '')
+        log_info(i18n.tr('request_body_text', preview=preview))
+
+    try:
+        client = create_client(ca_file, follow_redirects, max_redirects, DEFAULT_TIMEOUT)
+
+        # 准备请求参数
+        req_kwargs = {
+            'method': method,
+            'url': url,
+            'headers': headers,
+        }
+
+        # 处理请求体
+        if data:
+            if isinstance(data, bytes):
+                req_kwargs['content'] = data
+            else:
+                req_kwargs['data'] = data
+
+        # 发送请求
+        response = client.request(**req_kwargs)
+
+        # 检查响应大小
+        content_length = response.headers.get('content-length')
+        if content_length:
+            try:
+                if int(content_length) > MAX_RESPONSE_SIZE:
+                    log_error(i18n.tr('err_response_too_large', max_size=MAX_RESPONSE_SIZE))
+                    return False
+            except ValueError:
+                pass
+
+        # 读取响应体（流式，限制大小）
+        body_bytes = b''
+        total_read = 0
+        for chunk in response.iter_bytes(chunk_size=8192):
+            total_read += len(chunk)
+            if total_read > MAX_RESPONSE_SIZE:
+                log_error(i18n.tr('err_response_too_large', max_size=MAX_RESPONSE_SIZE))
+                return False
+            body_bytes += chunk
+
+        # 输出响应
+        print(i18n.tr('response_status', status_code=response.status_code))
+        print(i18n.tr('response_headers'))
+        for key, value in response.headers.items():
+            # httpx 返回的 headers 保留原始大小写
+            print(f"  {key}: {value}")
+        print()
+
+        if is_text_response(response.headers):
+            charset = 'utf-8'
+            content_type = response.headers.get('content-type', '')
+            if 'charset=' in content_type:
+                for part in content_type.split(';'):
+                    part = part.strip()
+                    if part.lower().startswith('charset='):
+                        charset = part[8:].strip(' "\'')
+                        break
+            try:
+                body_text = body_bytes.decode(charset, errors='replace')
+            except LookupError:
+                body_text = body_bytes.decode('utf-8', errors='replace')
+            print(body_text)
+        else:
+            sys.stdout.buffer.write(body_bytes)
+            sys.stdout.buffer.flush()
+
+        return True
+
+    except httpx.TimeoutException:
+        log_error(i18n.tr('err_timeout'))
+    except httpx.ConnectError as e:
+        log_error(i18n.tr('err_connection_refused'))
+        log_error(str(e))
+    except httpx.NetworkError as e:
+        log_error(i18n.tr('err_network', error=e))
+    except httpx.TooManyRedirects:
+        log_error(i18n.tr('err_redirect_limit', max_redirects=max_redirects))
+    except httpx.InvalidURL as e:
+        log_error(i18n.tr('err_request_failed', error=e))
+    except ssl.SSLError as e:
+        log_error(i18n.tr('err_ssl', error=e))
+    except Exception as e:
+        log_error(i18n.tr('err_request_failed', error=e))
+    return False
 
 
 def print_help(i18n: I18n) -> None:
@@ -815,7 +522,6 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    # 初始化 i18n
     lang = detect_language(args.lang)
     set_i18n(lang)
     i18n = get_i18n()
